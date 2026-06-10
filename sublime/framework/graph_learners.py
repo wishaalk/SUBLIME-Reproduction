@@ -108,30 +108,6 @@ def _fgp_init(features, k, metric, shift):
     return adj * shift - shift                            # edges -> 0, non-edges -> -shift
 
 
-# D~^-1/2 (A + I) D~^-1/2: standard symmetric GCN normalization, sparse or dense
-def _normalize_adj(adj, sparse):
-    n = adj.shape[0]
-    if sparse:
-        adj = adj.coalesce()
-        eye_idx = torch.arange(n, device=adj.device)
-        eye = torch.sparse_coo_tensor(
-            torch.stack([eye_idx, eye_idx]), torch.ones(n, device=adj.device), (n, n)
-        )
-        adj = (adj + eye).coalesce()                  # add self-loops
-        deg = torch.sparse.sum(adj, dim=1).to_dense()
-        d_inv_sqrt = deg.pow(-0.5)
-        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-        row, col = adj.indices()
-        values = adj.values() * d_inv_sqrt[row] * d_inv_sqrt[col]
-        return torch.sparse_coo_tensor(adj.indices(), values, (n, n)).coalesce()
-
-    adj = adj + torch.eye(n, device=adj.device, dtype=adj.dtype)   # add self-loops
-    deg = adj.sum(dim=1)
-    d_inv_sqrt = deg.pow(-0.5)
-    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-    return d_inv_sqrt.unsqueeze(1) * adj * d_inv_sqrt.unsqueeze(0)
-
-
 # one GAT-like layer: rescale every feature dim by a learned scalar
 class _Attentive(nn.Module):
     def __init__(self, dim):
@@ -213,10 +189,12 @@ class _MetricLearner(GraphLearner):
         return layer(h)
 
     def _embed(self, features, adj):
-        norm_adj = _normalize_adj(adj, self.sparse) if self.needs_adj else None
+        # adj is used as-is by the GNN learner. The original passes
+        # pre-normalized D^-1/2 A D^-1/2 adj to GNN_learner and runs layers
+        # directly on it; we follow the same contract -- caller normalizes.
         h = features
         for i, layer in enumerate(self.layers):
-            h = self._apply_layer(layer, h, norm_adj)
+            h = self._apply_layer(layer, h, adj)
             if i != len(self.layers) - 1:
                 h = _apply_activation(h, self.activation)
         return h
