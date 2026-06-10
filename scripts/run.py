@@ -61,7 +61,7 @@ from configs import CONFIGS
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
     # Experimental setting -- original main.py
     p.add_argument("-dataset", type=str, default="cora")
     p.add_argument("-ntrials", type=int, default=5)
@@ -290,7 +290,7 @@ def perturb_anchor_adj(dataset, mode: str, rate: float, seed: int, sparse: bool)
 def _resolve_config_defaults(parser: argparse.ArgumentParser) -> None:
     """Two-pass: peek for `-config`, pull defaults from `configs.CONFIGS`, then
     let the main parse_args still override anything on the command line."""
-    pre = argparse.ArgumentParser(add_help=False)
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("-config", type=str, default=None)
     pre.add_argument("-config_index", type=int, default=None)
     pre_args, _ = pre.parse_known_args()
