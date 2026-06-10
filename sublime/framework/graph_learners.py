@@ -1,24 +1,19 @@
-"""Graph learners p_omega(.) (Sec 4.1 of the SUBLIME paper).
+"""Graph structure learners p_omega(.).
 
-A graph learner maps the node features X (and, for the GNN learner, the
-original adjacency matrix A) to a *sketched* adjacency matrix S~:
+A learner maps node features X (and, for the GNN learner, the original
+adjacency A) to a sketched adjacency matrix S~:
 
-    FGP learner (Eq. 1):  S~ = sigma(Omega)
-    Metric learners (Eq. 2): S~ = phi(h_omega(X, A)) = phi(E)
+    FGP:     S~ = sigma(Omega)
+    Metric:  S~ = phi(h_omega(X, A))    with phi = cosine similarity
 
-phi is the (non-parametric) cosine similarity between node embeddings E.
-The post-processor (post_processor.py) turns S~ into the learned structure
-S via sparsification, activation, symmetrization and normalization
-(Eq. 6-8).
+The post-processor (post_processor.py) then turns S~ into the final structure
+S via sparsify -> activate -> symmetrize -> normalize.
 
-Two exceptions to that clean split, both following the paper:
-  - The FGP learner applies its own activation (ELU + 1, Sec 4.2) and is
-    never sparsified, so its `forward` already returns the post-activation
-    S~ that the post-processor should only symmetrize/normalize.
-  - When `sparse=True`, the metric learners perform a locality-sensitive
-    kNN sparsification themselves (Sec 4.5) and return S~ as a sparse COO
-    tensor containing only the top-k entries per row, since the full n x n
-    similarity matrix would not fit in memory for large graphs.
+Two exceptions to that clean split:
+  - FGP applies its own activation (ELU + 1) and is never sparsified, so its
+    forward already returns the activated S~.
+  - For sparse=True, the metric learners do top-k + degree-norm themselves
+    because the full n x n similarity matrix won't fit in memory.
 """
 from __future__ import annotations
 
@@ -30,11 +25,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.neighbors import kneighbors_graph
 
+# FGP init shift. The paper doesn't name this constant; main.py hardcodes 6.
+# After kNN+I is scaled by (x * I - I), edges land at 0 and non-edges at -I,
+# so elu+1 gives ~1 for edges and ~0 for non-edges at init.
+_FGP_INIT_SHIFT = 6
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
+# between-layer activation for the metric learners
 def _apply_activation(x, name):
     if name == "relu":
         return F.relu(x)
@@ -43,35 +44,51 @@ def _apply_activation(x, name):
     raise ValueError(f"unsupported activation: {name!r}")
 
 
+# dense phi(E): pairwise cosine similarity
 def _cosine_similarity(embeddings):
-    """Dense phi(E): pairwise cosine similarity, Eq. 2."""
     embeddings = F.normalize(embeddings, dim=1, p=2)
     return embeddings @ embeddings.t()
 
 
+# batched cosine + symmetric top-k for the large-graph sparse path.
+# k+1 because every row's top entry is its self-similarity (=1), so we keep
+# k actual neighbours per node, matching the dense path's top_k(sim, k+1).
+# After the top-k, values are degree-normalized: v *= D_row^-0.5 * D_col^-0.5,
+# where D = row_sum + col_sum of the raw top-k similarities (matching knn_fast).
 def _sparse_topk_similarity(embeddings, k, batch_size=1000):
-    """Locality-sensitive approximation of phi(E) + kNN sparsification (Sec 4.5).
-
-    Computes cosine similarities batch-by-batch so the full n x n matrix is
-    never materialized, keeping only the top-k neighbors per node (in both
-    directions, to keep S~ symmetric).
-    """
     embeddings = F.normalize(embeddings, dim=1, p=2)
     n = embeddings.shape[0]
+    keep = k + 1
 
     rows, cols, values = [], [], []
+    norm_row = torch.zeros(n, device=embeddings.device)
+    norm_col = torch.zeros(n, device=embeddings.device)
+
+    # walk the rows in chunks so the full n x n sim matrix is never materialized
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         sims = embeddings[start:end] @ embeddings.t()
-        vals, inds = sims.topk(k=k, dim=-1)
-        rows.append(torch.arange(start, end, device=embeddings.device).repeat_interleave(k))
+        vals, inds = sims.topk(k=keep, dim=-1)
+        rows.append(torch.arange(start, end, device=embeddings.device).repeat_interleave(keep))
         cols.append(inds.reshape(-1))
         values.append(vals.reshape(-1))
+        # accumulate degree: row gets sum of its top-k vals, col gets scatter-add
+        norm_row[start:end] = vals.sum(dim=1)
+        norm_col.index_add_(-1, inds.reshape(-1), vals.reshape(-1))
 
     rows = torch.cat(rows)
     cols = torch.cat(cols)
     values = torch.cat(values)
 
+    # symmetric degree normalization on the values (same as knn_fast in the original)
+    norm = norm_row + norm_col
+    values = values * (norm[rows.long()].pow(-0.5) * norm[cols.long()].pow(-0.5))
+
+    # relu: zero any negative values (defensive; top-k cosines are almost always
+    # positive, but the original applies relu here so we match it)
+    values = F.relu(values)
+
+    # also keep the transposed entries so S~ stays symmetric
     rows_sym = torch.cat([rows, cols])
     cols_sym = torch.cat([cols, rows])
     values_sym = torch.cat([values, values])
@@ -79,21 +96,20 @@ def _sparse_topk_similarity(embeddings, k, batch_size=1000):
     return torch.sparse_coo_tensor(indices, values_sym, (n, n)).coalesce()
 
 
-def _knn_init_adj(features, k, metric):
-    """Binary, symmetric kNN graph over the raw input features.
 
-    Used to initialize the FGP learner's parameters: edges of the kNN graph
-    start at 1, all other entries start at 0 (Sec 4.3.1).
-    """
+# kNN graph over raw features + self-loops, shifted so that after FGP's elu+1
+# activation, edges start at ~1 and non-edges at ~0
+def _fgp_init(features, k, metric, shift):
     if torch.is_tensor(features):
         features = features.detach().cpu().numpy()
     adj = kneighbors_graph(features, k, metric=metric, include_self=False)
     adj = adj.toarray().astype(np.float32)
-    return np.maximum(adj, adj.T)
+    adj = adj + np.eye(adj.shape[0], dtype=np.float32)   # add self-loops
+    return adj * shift - shift                            # edges -> 0, non-edges -> -shift
 
 
+# D~^-1/2 (A + I) D~^-1/2: standard symmetric GCN normalization, sparse or dense
 def _normalize_adj(adj, sparse):
-    """Symmetric normalization with self-loops: D~^-1/2 (A + I) D~^-1/2 (Eq. 5)."""
     n = adj.shape[0]
     if sparse:
         adj = adj.coalesce()
@@ -101,7 +117,7 @@ def _normalize_adj(adj, sparse):
         eye = torch.sparse_coo_tensor(
             torch.stack([eye_idx, eye_idx]), torch.ones(n, device=adj.device), (n, n)
         )
-        adj = (adj + eye).coalesce()
+        adj = (adj + eye).coalesce()                  # add self-loops
         deg = torch.sparse.sum(adj, dim=1).to_dense()
         d_inv_sqrt = deg.pow(-0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
@@ -109,17 +125,15 @@ def _normalize_adj(adj, sparse):
         values = adj.values() * d_inv_sqrt[row] * d_inv_sqrt[col]
         return torch.sparse_coo_tensor(adj.indices(), values, (n, n)).coalesce()
 
-    adj = adj + torch.eye(n, device=adj.device, dtype=adj.dtype)
+    adj = adj + torch.eye(n, device=adj.device, dtype=adj.dtype)   # add self-loops
     deg = adj.sum(dim=1)
     d_inv_sqrt = deg.pow(-0.5)
     d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
     return d_inv_sqrt.unsqueeze(1) * adj * d_inv_sqrt.unsqueeze(0)
 
 
+# one GAT-like layer: rescale every feature dim by a learned scalar
 class _Attentive(nn.Module):
-    """One layer of the GAT-like embedding network (Eq. 3): rescales each
-    feature dimension by a learned weight (Hadamard product)."""
-
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -128,9 +142,8 @@ class _Attentive(nn.Module):
         return x * self.weight
 
 
+# one GCN layer: h' = norm_adj @ (h W + b)
 class _GCNConv(nn.Module):
-    """One GCN layer (Eq. 5): h' = norm_adj @ (h @ W + b)."""
-
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim)
@@ -146,148 +159,131 @@ class _GCNConv(nn.Module):
 # base class
 # ---------------------------------------------------------------------------
 
+# every learner returns S~: dense (n, n), or sparse COO (n, n) with k entries per row
 class GraphLearner(nn.Module, abc.ABC):
-    """Base class for the graph structure learners p_omega(.) of Sec 4.1."""
-
     def __init__(self, sparse=False):
         super().__init__()
         self.sparse = sparse
 
+    # adj is only used by GNNLearner (structure refinement), ignored elsewhere
     @abc.abstractmethod
     def forward(self, features, adj=None):
-        """Compute the sketched adjacency matrix S~.
-
-        Args:
-            features: node feature matrix X, shape (n, d).
-            adj: original adjacency matrix A. Required by the GNN learner
-                (structure refinement only); ignored otherwise.
-
-        Returns:
-            S~: a dense (n, n) tensor, or - for the metric learners with
-            `sparse=True` - a sparse COO (n, n) tensor with k entries per row.
-        """
+        ...
 
 
 # ---------------------------------------------------------------------------
-# learners
+# FGP: every entry of A is a free parameter, init from kNN over X
 # ---------------------------------------------------------------------------
 
+# sigma = ELU + 1 is applied here directly; FGP skips the post-processor's
+# sparsify/activate steps to keep gradients flowing to every entry of S~
 class FGPLearner(GraphLearner):
-    """Full graph parameterization learner (Eq. 1).
-
-    Each entry of the adjacency matrix is an independent learnable
-    parameter Omega_ij, initialized from a kNN graph over the input features
-    (Sec 4.3.1). sigma is ELU + 1 (Sec 4.2): this is applied here directly
-    because FGP skips the post-processor's sparsification/activation steps,
-    to keep the gradient flowing to every entry of S~.
-    """
-
-    def __init__(self, features, k, knn_metric="cosine"):
+    def __init__(self, features, k, knn_metric="cosine", init_shift=_FGP_INIT_SHIFT):
         super().__init__(sparse=False)
-        init_adj = _knn_init_adj(features, k, knn_metric)
+        init_adj = _fgp_init(features, k, knn_metric, init_shift)
         self.omega = nn.Parameter(torch.from_numpy(init_adj).float())
 
     def forward(self, features=None, adj=None):
         return F.elu(self.omega) + 1
 
 
-class AttentiveLearner(GraphLearner):
-    """GAT-like attentive metric learner (Eq. 2 & 3).
+# ---------------------------------------------------------------------------
+# metric learners: S~ = cosine(h_omega(X)), three flavours of h_omega
+# ---------------------------------------------------------------------------
 
-    Each layer rescales every feature dimension by a learned weight vector,
-    assuming features contribute independently to the existence of an edge
-    with no correlation between them. Weights are initialized to 1, so
-    E = X at the start of training (Sec 4.3.1).
-    """
+# Base for ATT / MLP / GNN: build layers, embed, then cosine sim.
+# Subclasses just define how to build and apply a layer.
+class _MetricLearner(GraphLearner):
+    # GNN overrides to True so adj is normalized and passed into every layer
+    needs_adj = False
 
-    def __init__(self, in_dim, n_layers=2, k=30, knn_metric="cosine",
-                 activation="relu", sparse=False):
+    def __init__(self, n_layers, k, activation, sparse):
         super().__init__(sparse=sparse)
-        self.layers = nn.ModuleList(_Attentive(in_dim) for _ in range(n_layers))
         self.k = k
         self.activation = activation
+        self.layers = nn.ModuleList(self._make_layer() for _ in range(n_layers))
 
-    def _embed(self, features):
+    # subclass: how to construct one layer
+    @abc.abstractmethod
+    def _make_layer(self):
+        ...
+
+    # subclass: how to apply one layer (ATT/MLP ignore norm_adj, GNN uses it)
+    def _apply_layer(self, layer, h, norm_adj):
+        return layer(h)
+
+    def _embed(self, features, adj):
+        norm_adj = _normalize_adj(adj, self.sparse) if self.needs_adj else None
         h = features
         for i, layer in enumerate(self.layers):
-            h = layer(h)
+            h = self._apply_layer(layer, h, norm_adj)
             if i != len(self.layers) - 1:
                 h = _apply_activation(h, self.activation)
         return h
 
     def forward(self, features, adj=None):
-        embeddings = self._embed(features)
+        if self.needs_adj and adj is None:
+            raise ValueError(f"{type(self).__name__} requires the original adjacency `adj`")
+        embeddings = self._embed(features, adj)
         if self.sparse:
             return _sparse_topk_similarity(embeddings, self.k)
         return _cosine_similarity(embeddings)
 
 
-class MLPLearner(GraphLearner):
-    """MLP-based metric learner (Eq. 2 & 4).
+# Attentive: per-dim scalars, treats feature dims as independent.
+# Weights init to 1 so E = X at the start of training.
+class AttentiveLearner(_MetricLearner):
+    def __init__(self, in_dim, n_layers=2, k=30, knn_metric="cosine",
+                 activation="relu", sparse=False):
+        self.in_dim = in_dim
+        super().__init__(n_layers, k, activation, sparse)
 
-    Each layer is a square linear map, additionally modeling correlations
-    and combinations between feature dimensions compared to the attentive
-    learner. Weights are initialized to the identity (and biases to zero),
-    so E = X at the start of training (Sec 4.3.1).
-    """
+    def _make_layer(self):
+        return _Attentive(self.in_dim)
+
+
+# Linear with weight = identity and bias = 0, so layer(X) = X at step 0.
+# The paper specifies identity weights AND zero biases (so E = X at the first
+# iteration); the original code only sets the weights and leaves PyTorch's
+# random bias init. This file follows the paper.
+def _identity_linear(in_dim):
+    layer = nn.Linear(in_dim, in_dim)
+    layer.weight = nn.Parameter(torch.eye(in_dim))
+    nn.init.zeros_(layer.bias)
+    return layer
+
+
+# MLP: square linear maps, also model correlations between feature dims.
+class MLPLearner(_MetricLearner):
+    def __init__(self, in_dim, n_layers=2, k=30, knn_metric="cosine",
+                 activation="relu", sparse=False):
+        self.in_dim = in_dim
+        super().__init__(n_layers, k, activation, sparse)
+
+    def _make_layer(self):
+        return _identity_linear(self.in_dim)
+
+
+# GNN: GCN over the original adjacency, so S~ also reflects topology.
+# SR only -- needs adj.
+#
+# Same init situation as the MLP: the paper wants E = A_hat X at step 0.
+# The original code tries `layer.weight = eye`, but `layer` is the outer GCN
+# module (no `weight` attr -- the real Linear lives at `layer.linear`), so
+# identity init silently fails and the GCN starts random. We do what the paper
+# says: set the inner Linear to identity.
+class GNNLearner(_MetricLearner):
+    needs_adj = True
 
     def __init__(self, in_dim, n_layers=2, k=30, knn_metric="cosine",
                  activation="relu", sparse=False):
-        super().__init__(sparse=sparse)
-        self.layers = nn.ModuleList(nn.Linear(in_dim, in_dim) for _ in range(n_layers))
-        for layer in self.layers:
-            layer.weight = nn.Parameter(torch.eye(in_dim))
-            nn.init.zeros_(layer.bias)
-        self.k = k
-        self.activation = activation
+        self.in_dim = in_dim
+        super().__init__(n_layers, k, activation, sparse)
 
-    def _embed(self, features):
-        h = features
-        for i, layer in enumerate(self.layers):
-            h = layer(h)
-            if i != len(self.layers) - 1:
-                h = _apply_activation(h, self.activation)
-        return h
+    def _make_layer(self):
+        conv = _GCNConv(self.in_dim, self.in_dim)
+        conv.linear = _identity_linear(self.in_dim)
+        return conv
 
-    def forward(self, features, adj=None):
-        embeddings = self._embed(features)
-        if self.sparse:
-            return _sparse_topk_similarity(embeddings, self.k)
-        return _cosine_similarity(embeddings)
-
-
-class GNNLearner(GraphLearner):
-    """GCN-based metric learner (Eq. 2 & 5), structure refinement only.
-
-    Embeds features together with the (normalized) original adjacency
-    matrix via GCN layers, so the learned similarities also reflect the
-    original topology. Weights are initialized to the identity (and biases
-    to zero), as for the MLP learner.
-    """
-
-    def __init__(self, in_dim, n_layers=2, k=30, knn_metric="cosine",
-                 activation="relu", sparse=False):
-        super().__init__(sparse=sparse)
-        self.layers = nn.ModuleList(_GCNConv(in_dim, in_dim) for _ in range(n_layers))
-        for layer in self.layers:
-            layer.linear.weight = nn.Parameter(torch.eye(in_dim))
-            nn.init.zeros_(layer.linear.bias)
-        self.k = k
-        self.activation = activation
-
-    def _embed(self, features, norm_adj):
-        h = features
-        for i, layer in enumerate(self.layers):
-            h = layer(h, norm_adj)
-            if i != len(self.layers) - 1:
-                h = _apply_activation(h, self.activation)
-        return h
-
-    def forward(self, features, adj):
-        if adj is None:
-            raise ValueError("GNNLearner requires the original adjacency matrix `adj`")
-        norm_adj = _normalize_adj(adj, self.sparse)
-        embeddings = self._embed(features, norm_adj)
-        if self.sparse:
-            return _sparse_topk_similarity(embeddings, self.k)
-        return _cosine_similarity(embeddings)
+    def _apply_layer(self, layer, h, norm_adj):
+        return layer(h, norm_adj)
