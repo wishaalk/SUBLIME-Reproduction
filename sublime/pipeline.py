@@ -298,8 +298,15 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
         if epoch % cfg.eval_freq == 0:
             model.eval()
             learner.eval()
-            with torch.no_grad():
-                eval_adj = _learn_structure(learner, features, gnn_adj, cfg).detach()
+            # The original evaluates on the SAME learned_adj from the training
+            # step (not a fresh learner forward). It just detaches values.
+            if cfg.sparse:
+                eval_adj = learned_adj.coalesce()
+                eval_adj = torch.sparse_coo_tensor(
+                    eval_adj.indices(), eval_adj.values().detach(), eval_adj.shape
+                ).coalesce()
+            else:
+                eval_adj = learned_adj.detach()
 
             if cfg.task == "classification":
                 val_acc, test_acc = evaluate_classification(

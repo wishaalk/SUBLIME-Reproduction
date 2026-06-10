@@ -55,37 +55,46 @@ def _cosine_similarity(embeddings):
 # k actual neighbours per node, matching the dense path's top_k(sim, k+1).
 # After the top-k, values are degree-normalized: v *= D_row^-0.5 * D_col^-0.5,
 # where D = row_sum + col_sum of the raw top-k similarities (matching knn_fast).
+#
+# IMPORTANT: values are detached from the computation graph. This matches the
+# original knn_fast() which writes into a pre-allocated torch.zeros() tensor,
+# effectively breaking gradient flow to the learner parameters through the edge
+# values. The learner's sparse path does NOT receive gradients from the encoder
+# in the original code (DGL message passing on detached edata['w']).
 def _sparse_topk_similarity(embeddings, k, batch_size=1000):
     embeddings = F.normalize(embeddings, dim=1, p=2)
     n = embeddings.shape[0]
     keep = k + 1
 
-    rows, cols, values = [], [], []
+    # pre-allocate output arrays (matching knn_fast's pattern)
+    total = n * keep
+    values = torch.zeros(total, device=embeddings.device)
+    rows = torch.zeros(total, dtype=torch.long, device=embeddings.device)
+    cols = torch.zeros(total, dtype=torch.long, device=embeddings.device)
     norm_row = torch.zeros(n, device=embeddings.device)
     norm_col = torch.zeros(n, device=embeddings.device)
 
     # walk the rows in chunks so the full n x n sim matrix is never materialized
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        sims = embeddings[start:end] @ embeddings.t()
+    index = 0
+    while index < n:
+        end = min(index + batch_size, n)
+        sims = embeddings[index:end] @ embeddings.t()
         vals, inds = sims.topk(k=keep, dim=-1)
-        rows.append(torch.arange(start, end, device=embeddings.device).repeat_interleave(keep))
-        cols.append(inds.reshape(-1))
-        values.append(vals.reshape(-1))
-        # accumulate degree: row gets sum of its top-k vals, col gets scatter-add
-        norm_row[start:end] = vals.sum(dim=1)
+        chunk = (end - index) * keep
+        values[index * keep:end * keep] = vals.reshape(-1)
+        cols[index * keep:end * keep] = inds.reshape(-1)
+        rows[index * keep:end * keep] = torch.arange(index, end, device=embeddings.device).view(-1, 1).repeat(1, keep).reshape(-1)
+        # accumulate degree
+        norm_row[index:end] = vals.sum(dim=1)
         norm_col.index_add_(-1, inds.reshape(-1), vals.reshape(-1))
+        index += batch_size
 
-    rows = torch.cat(rows)
-    cols = torch.cat(cols)
-    values = torch.cat(values)
-
-    # symmetric degree normalization on the values (same as knn_fast in the original)
+    # symmetric degree normalization on the values (same as knn_fast)
     norm = norm_row + norm_col
-    values = values * (norm[rows.long()].pow(-0.5) * norm[cols.long()].pow(-0.5))
+    values = values * (norm[rows].pow(-0.5) * norm[cols].pow(-0.5))
 
-    # relu: zero any negative values (defensive; top-k cosines are almost always
-    # positive, but the original applies relu here so we match it)
+    # relu: zero any negative values (the original applies relu via
+    # apply_non_linearity with non_linearity='relu')
     values = F.relu(values)
 
     # also keep the transposed entries so S~ stays symmetric
@@ -93,7 +102,7 @@ def _sparse_topk_similarity(embeddings, k, batch_size=1000):
     cols_sym = torch.cat([cols, rows])
     values_sym = torch.cat([values, values])
     indices = torch.stack([rows_sym, cols_sym])
-    return torch.sparse_coo_tensor(indices, values_sym, (n, n)).coalesce()
+    return torch.sparse_coo_tensor(indices, values_sym.detach(), (n, n)).coalesce()
 
 
 

@@ -10,6 +10,12 @@ import torch.nn as nn
 # `sparse` flag selecting matmul vs torch.sparse.mm) and GCNConv_dgl for DGL
 # graph adj. We don't carry DGL through our learners, so a single conv with
 # is_sparse dispatch covers everything we need.
+#
+# IMPORTANT: In the sparse path, adj.values() must NOT require grad. The original
+# avoids this problem by using DGL message passing; our version achieves the same
+# effect by detaching values in _sparse_topk_similarity (see graph_learners.py).
+# If values ever required grad here, torch.sparse.mm backward would try to
+# materialize a dense N x N gradient and OOM on large graphs.
 class GCNConv(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
