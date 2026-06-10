@@ -130,13 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-rate", type=float, default=0.0)
     p.add_argument("-perturb_seed", type=int, default=0)
 
-    # Pre-baked configs from configs.py. CLI flags still override.
-    p.add_argument("-config", type=str, default=None,
-                   help="name of an entry in configs.CONFIGS; sets defaults that "
-                        "CLI flags can still override")
-    p.add_argument("-config_index", type=int, default=None,
-                   help="if -config maps to a list (e.g. fig3_*_tau_sweep, "
-                        "fig5_robustness), pick this index")
+    # Note: `-config` and `-config_index` are handled manually in main() and
+    # stripped from argv before argparse sees them, to avoid argparse's
+    # single-dash prefix matching colliding with the existing `-c` flag.
     return p
 
 
@@ -287,45 +283,78 @@ def perturb_anchor_adj(dataset, mode: str, rate: float, seed: int, sparse: bool)
 # main
 # ---------------------------------------------------------------------------
 
-def _resolve_config_defaults(parser: argparse.ArgumentParser) -> None:
-    """Two-pass: peek for `-config`, pull defaults from `configs.CONFIGS`, then
-    let the main parse_args still override anything on the command line."""
-    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    pre.add_argument("-config", type=str, default=None)
-    pre.add_argument("-config_index", type=int, default=None)
-    pre_args, _ = pre.parse_known_args()
-    if not pre_args.config:
+def _extract_config_flags(argv):
+    """Strip `-config NAME` and `-config_index N` from argv manually.
+
+    We do this by hand rather than via a pre-`argparse.ArgumentParser` because
+    argparse's single-dash long options (`-config`) always do prefix matching
+    against every registered option, which makes them collide with the existing
+    `-c` flag from the original SUBLIME CLI regardless of `allow_abbrev`.
+    """
+    cfg_name = None
+    cfg_index = None
+    out = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "-config":
+            if i + 1 >= len(argv):
+                raise SystemExit("run.py: error: -config requires an argument")
+            cfg_name = argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("-config="):
+            cfg_name = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "-config_index":
+            if i + 1 >= len(argv):
+                raise SystemExit("run.py: error: -config_index requires an argument")
+            cfg_index = int(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("-config_index="):
+            cfg_index = int(tok.split("=", 1)[1])
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return cfg_name, cfg_index, out
+
+
+def _resolve_config_defaults(parser, cfg_name, cfg_index):
+    if not cfg_name:
         return
-    if pre_args.config not in CONFIGS:
+    if cfg_name not in CONFIGS:
         parser.error(
-            f"unknown -config {pre_args.config!r}; available: "
-            f"{sorted(CONFIGS)}"
+            f"unknown -config {cfg_name!r}; available: {sorted(CONFIGS)}"
         )
-    entry = CONFIGS[pre_args.config]
+    entry = CONFIGS[cfg_name]
     if isinstance(entry, list):
-        if pre_args.config_index is None:
+        if cfg_index is None:
             parser.error(
-                f"-config {pre_args.config!r} is a list of {len(entry)} "
-                f"variants; pass -config_index 0..{len(entry)-1}"
+                f"-config {cfg_name!r} is a list of {len(entry)} variants; "
+                f"pass -config_index 0..{len(entry)-1}"
             )
-        entry = entry[pre_args.config_index]
-    elif pre_args.config_index is not None:
+        entry = entry[cfg_index]
+    elif cfg_index is not None:
         parser.error(
-            f"-config_index given but -config {pre_args.config!r} is not a list"
+            f"-config_index given but -config {cfg_name!r} is not a list"
         )
     known = {a.dest for a in parser._actions}
     unknown = [k for k in entry if k not in known]
     if unknown:
         parser.error(
-            f"config {pre_args.config!r} has keys with no matching flag: {unknown}"
+            f"config {cfg_name!r} has keys with no matching flag: {unknown}"
         )
     parser.set_defaults(**entry)
 
 
 def main():
+    cfg_name, cfg_index, rest = _extract_config_flags(sys.argv[1:])
     parser = build_parser()
-    _resolve_config_defaults(parser)
-    args = parser.parse_args()
+    _resolve_config_defaults(parser, cfg_name, cfg_index)
+    args = parser.parse_args(rest)
 
     # Per-epoch loss logger.
     #   - With -emit_curves: default to every-epoch logging (interval = 0),
