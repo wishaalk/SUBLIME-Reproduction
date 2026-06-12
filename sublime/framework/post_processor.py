@@ -51,15 +51,25 @@ def _normalize_sym(adj):
 # full post-processing pipelines
 # ---------------------------------------------------------------------------
 
-def post_process_dense(adj, k, is_fgp=False):
+def post_process_dense(adj, k, is_fgp=False, *,
+                       do_topk=True, do_relu=True,
+                       do_sym=True, do_norm=True):
     """Dense pipeline: top_k -> relu -> symmetrize -> normalize.
-    FGP skips top_k and relu (already activated).
+
+    FGP skips top_k and relu unconditionally (already activated via elu+1).
+
+    The four `do_*` toggles let an ablation study disable individual steps.
+    Defaults preserve the original pipeline.
     """
     if not is_fgp:
-        adj = _top_k(adj, k + 1)    # +1 for the self-entry
-        adj = F.relu(adj)            # zero negative cosines
-    adj = _symmetrize(adj)
-    adj = _normalize_sym(adj)
+        if do_topk:
+            adj = _top_k(adj, k + 1)    # +1 for the self-entry
+        if do_relu:
+            adj = F.relu(adj)           # zero negative cosines
+    if do_sym:
+        adj = _symmetrize(adj)
+    if do_norm:
+        adj = _normalize_sym(adj)
     return adj
 
 

@@ -130,6 +130,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-rate", type=float, default=0.0)
     p.add_argument("-perturb_seed", type=int, default=0)
 
+    # Post-processor ablation toggles (dense path only; default = full pipeline).
+    # Each flag disables one step of S~ -> top_k -> relu -> symmetrize -> normalize.
+    p.add_argument("-no_topk", action="store_true", help="skip top-k sparsification")
+    p.add_argument("-no_relu", action="store_true", help="skip ReLU on similarities")
+    p.add_argument("-no_sym", action="store_true", help="skip symmetrization")
+    p.add_argument("-no_norm", action="store_true", help="skip degree normalization")
+
+    # Training-objective ablation (alternative to NT-Xent contrastive loss).
+    p.add_argument("-loss_type", type=str, default="contrastive",
+                   choices=["contrastive", "feature_sim", "none"],
+                   help="training objective: 'contrastive' (default), "
+                        "'feature_sim' (MSE vs cos(X,X^T), encoder unused), "
+                        "'none' (no training, eval initial learner)")
+
     # Note: `-config` and `-config_index` are handled manually in main() and
     # stripped from argv before argparse sees them, to avoid argparse's
     # single-dash prefix matching colliding with the existing `-c` flag.
@@ -166,6 +180,11 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         c=args.c,
         eval_freq=args.eval_freq,
         n_clu_trials=args.n_clu_trials,
+        pp_topk=not args.no_topk,
+        pp_relu=not args.no_relu,
+        pp_sym=not args.no_sym,
+        pp_norm=not args.no_norm,
+        loss_type=args.loss_type,
     )
 
 

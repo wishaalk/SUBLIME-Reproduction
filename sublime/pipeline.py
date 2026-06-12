@@ -21,6 +21,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .data import Dataset
 from .framework.augment import mask_features
@@ -84,6 +85,19 @@ class TrainConfig:
     # eval cadence
     eval_freq: int = 5
     n_clu_trials: int = 5            # KMeans trials for clustering task
+
+    # post-processor toggles (dense path only; ablation use)
+    pp_topk: bool = True
+    pp_relu: bool = True
+    pp_sym: bool = True
+    pp_norm: bool = True
+
+    # training-objective ablation:
+    #   'contrastive' - SUBLIME's default NT-Xent on two augmented encoder views
+    #   'feature_sim' - MSE between the learned adjacency and cos(X, X^T);
+    #                   ignores the encoder, no bootstrap, no augmentation
+    #   'none'        - no training; evaluate the learner at its random init
+    loss_type: str = "contrastive"
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +199,12 @@ def _learn_structure(learner, features, gnn_adj, cfg: TrainConfig):
 
     if cfg.sparse:
         return post_process_sparse(s_tilde)
-    return post_process_dense(s_tilde, cfg.learner_k, is_fgp=isinstance(learner, FGPLearner))
+    return post_process_dense(
+        s_tilde, cfg.learner_k,
+        is_fgp=isinstance(learner, FGPLearner),
+        do_topk=cfg.pp_topk, do_relu=cfg.pp_relu,
+        do_sym=cfg.pp_sym, do_norm=cfg.pp_norm,
+    )
 
 
 # anchor = tau * anchor + (1 - tau) * learned, with learned detached.
@@ -270,29 +289,102 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
     result = TrialResult()
     best_val = 0.0
 
+    # ---- loss-ablation: 'none' = no training, just eval the initial learner ----
+    if cfg.loss_type == "none":
+        model.eval()
+        learner.eval()
+        with torch.no_grad():
+            learned_adj = _learn_structure(learner, features, gnn_adj, cfg)
+            if cfg.sparse:
+                eval_adj = torch.sparse_coo_tensor(
+                    learned_adj.indices(), learned_adj.values().detach(), learned_adj.shape
+                ).coalesce()
+            else:
+                eval_adj = learned_adj.detach()
+            if cfg.task == "classification":
+                val_acc, test_acc = evaluate_classification(
+                    eval_adj, features, labels, dataset.n_classes,
+                    train_mask, val_mask, test_mask,
+                    sparse=cfg.sparse, cfg=cls_cfg,
+                )
+                result.best_val_acc = float(val_acc) if torch.is_tensor(val_acc) else val_acc
+                result.best_test_acc = float(test_acc) if torch.is_tensor(test_acc) else test_acc
+                result.best_epoch = 0
+            else:
+                _, embedding = model(features, learned_adj)
+                result.cluster_scores = evaluate_clustering(
+                    embedding, labels, dataset.n_classes, n_trials=cfg.n_clu_trials,
+                )
+        return result
+
+    # ---- loss-ablation: precompute cosine target for 'feature_sim' ----
+    # MSE is computed on the RAW learner output (before post-processing), so
+    # gradients flow through every entry of S~ instead of being masked out by
+    # the non-differentiable top-k. Post-processing is still applied at eval
+    # time via `_learn_structure` so the downstream classifier sees the same
+    # structure as in the contrastive setting.
+    #
+    # Scale note: for ATT/MLP/GNN the learner returns cos(h_omega(X)), so both
+    # pred and target live in [-1, 1]. For FGP the learner returns elu(omega)+1
+    # (non-negative, no upper bound) which doesn't match the cosine range, but
+    # MSE still pulls omega toward producing cos(X, X^T) at every entry --
+    # FGP's init from kNN(X) already lives close to that target so this is a
+    # near-no-op for FGP and a real training signal for ATT/MLP.
+    target_sim = None
+    if cfg.loss_type == "feature_sim":
+        if cfg.sparse:
+            raise ValueError("loss_type='feature_sim' requires -sparse 0 (dense path)")
+        with torch.no_grad():
+            feats_norm = F.normalize(features, p=2, dim=1)
+            target_sim = feats_norm @ feats_norm.t()
+
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         learner.train()
 
-        # --- contrastive step ---
-        feats_anchor = _augment(features, cfg.maskfeat_rate_anchor)
-        feats_learner = _augment(features, cfg.maskfeat_rate_learner)
+        if cfg.loss_type == "contrastive":
+            # post-processed structure is needed for the encoder's learner view
+            learned_adj = _learn_structure(learner, features, gnn_adj, cfg)
 
-        learned_adj = _learn_structure(learner, features, gnn_adj, cfg)
+            # --- contrastive step ---
+            feats_anchor = _augment(features, cfg.maskfeat_rate_anchor)
+            feats_learner = _augment(features, cfg.maskfeat_rate_learner)
 
-        z_anchor, _ = model(feats_anchor, anchor_adj)
-        z_learner, _ = model(feats_learner, learned_adj)
-        loss = _contrastive_loss(model, z_anchor, z_learner, cfg.contrast_batch_size)
+            z_anchor, _ = model(feats_anchor, anchor_adj)
+            z_learner, _ = model(feats_learner, learned_adj)
+            loss = _contrastive_loss(model, z_anchor, z_learner, cfg.contrast_batch_size)
 
-        opt_model.zero_grad()
-        opt_learner.zero_grad()
-        loss.backward()
-        opt_model.step()
-        opt_learner.step()
+            opt_model.zero_grad()
+            opt_learner.zero_grad()
+            loss.backward()
+            opt_model.step()
+            opt_learner.step()
 
-        # --- structure bootstrap ---
-        if (1.0 - cfg.tau) > 0 and (cfg.c == 0 or epoch % cfg.c == 0):
-            anchor_adj = _bootstrap(anchor_adj, learned_adj, cfg.tau, cfg.sparse)
+            # --- structure bootstrap (contrastive-specific) ---
+            if (1.0 - cfg.tau) > 0 and (cfg.c == 0 or epoch % cfg.c == 0):
+                anchor_adj = _bootstrap(anchor_adj, learned_adj, cfg.tau, cfg.sparse)
+
+        elif cfg.loss_type == "feature_sim":
+            # Supervise the RAW learner output (pre-post-processing) so the
+            # gradient reaches every entry of S~. For ATT/MLP/GNN this is
+            # cos(h_omega(X)); for FGP it's elu(omega)+1.
+            if isinstance(learner, GNNLearner):
+                s_tilde_raw = learner(features, gnn_adj)
+            else:
+                s_tilde_raw = learner(features)
+            loss = F.mse_loss(s_tilde_raw, target_sim)
+            opt_learner.zero_grad()
+            loss.backward()
+            opt_learner.step()
+
+            # Post-processed adjacency only needed at eval epochs; skip the
+            # wasted compute (and the dangling graph) on every other epoch.
+            if epoch % cfg.eval_freq == 0:
+                with torch.no_grad():
+                    learned_adj = _learn_structure(learner, features, gnn_adj, cfg)
+
+        else:
+            raise ValueError(f"unknown loss_type: {cfg.loss_type!r}")
 
         # --- periodic downstream eval ---
         if epoch % cfg.eval_freq == 0:
