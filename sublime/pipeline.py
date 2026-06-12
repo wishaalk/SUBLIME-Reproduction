@@ -301,20 +301,23 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
                 ).coalesce()
             else:
                 eval_adj = learned_adj.detach()
-            if cfg.task == "classification":
-                val_acc, test_acc = evaluate_classification(
-                    eval_adj, features, labels, dataset.n_classes,
-                    train_mask, val_mask, test_mask,
-                    sparse=cfg.sparse, cfg=cls_cfg,
-                )
-                result.best_val_acc = float(val_acc) if torch.is_tensor(val_acc) else val_acc
-                result.best_test_acc = float(test_acc) if torch.is_tensor(test_acc) else test_acc
-                result.best_epoch = 0
-            else:
+        # evaluate_classification trains a downstream GCN which needs autograd,
+        # so it MUST run outside the no_grad block above.
+        if cfg.task == "classification":
+            val_acc, test_acc = evaluate_classification(
+                eval_adj, features, labels, dataset.n_classes,
+                train_mask, val_mask, test_mask,
+                sparse=cfg.sparse, cfg=cls_cfg,
+            )
+            result.best_val_acc = float(val_acc) if torch.is_tensor(val_acc) else val_acc
+            result.best_test_acc = float(test_acc) if torch.is_tensor(test_acc) else test_acc
+            result.best_epoch = 0
+        else:
+            with torch.no_grad():
                 _, embedding = model(features, learned_adj)
-                result.cluster_scores = evaluate_clustering(
-                    embedding, labels, dataset.n_classes, n_trials=cfg.n_clu_trials,
-                )
+            result.cluster_scores = evaluate_clustering(
+                embedding, labels, dataset.n_classes, n_trials=cfg.n_clu_trials,
+            )
         return result
 
     # ---- loss-ablation: precompute cosine target for 'feature_sim' ----
