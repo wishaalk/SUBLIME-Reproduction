@@ -144,6 +144,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "'feature_sim' (MSE vs cos(X,X^T), encoder unused), "
                         "'none' (no training, eval initial learner)")
 
+    # Graph-baseline ablation (skip learner + training entirely; feed a
+    # fixed adjacency directly to the downstream classifier).
+    p.add_argument("-fixed_adj", type=str, default="none",
+                   choices=["none", "identity", "random_knn", "anchor", "load"],
+                   help="fixed adjacency baseline: 'identity' (A=I, GCN=MLP), "
+                        "'random_knn' (k random neighbors per node), "
+                        "'anchor' (SUBLIME's input graph: I for SI, real graph "
+                        "for SR), or 'load' (replay a saved adjacency via "
+                        "-load_adj). Skips learner + training; ignores -loss_type.")
+
+    # Core-test-1: dump the best-val learned adjacency to disk after a
+    # contrastive run, then replay it with -fixed_adj load -load_adj <dir>.
+    p.add_argument("-dump_adj", type=str, default="",
+                   help="directory to save best-val adjacency per seed "
+                        "(file pattern: '{dir}/seed{N}.pt').")
+    p.add_argument("-load_adj", type=str, default="",
+                   help="directory to load adjacency from when -fixed_adj load "
+                        "(file pattern: '{dir}/seed{N}.pt').")
+
     # Note: `-config` and `-config_index` are handled manually in main() and
     # stripped from argv before argparse sees them, to avoid argparse's
     # single-dash prefix matching colliding with the existing `-c` flag.
@@ -185,6 +204,9 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         pp_sym=not args.no_sym,
         pp_norm=not args.no_norm,
         loss_type=args.loss_type,
+        fixed_adj=args.fixed_adj,
+        dump_adj=args.dump_adj,
+        load_adj=args.load_adj,
     )
 
 

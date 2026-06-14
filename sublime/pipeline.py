@@ -15,6 +15,7 @@ Multiple trials run the same setup with different seeds; results are averaged.
 from __future__ import annotations
 
 import copy
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Optional
@@ -98,6 +99,29 @@ class TrainConfig:
     #                   ignores the encoder, no bootstrap, no augmentation
     #   'none'        - no training; evaluate the learner at its random init
     loss_type: str = "contrastive"
+
+    # graph-baseline ablation: skip the entire learner + training and feed a
+    # fixed adjacency straight to the downstream classifier.
+    #   'none'       - normal SUBLIME path (default)
+    #   'identity'   - A = I (GCN collapses to MLP-on-features)
+    #   'random_knn' - per-node random k neighbors, symmetrized + normalized
+    #   'anchor'     - the dataset's anchor adjacency (= sym-normed I for SI,
+    #                  sym-normed real graph for SR). For Core Test 1: vanilla
+    #                  GCN on the same input graph SUBLIME starts from.
+    #   'load'       - load a pre-saved adjacency from cfg.load_adj (see below)
+    fixed_adj: str = "none"
+
+    # Core-test-1: persist the learned adjacency to disk and replay it through
+    # a vanilla downstream GCN (with no SUBLIME machinery) to test whether the
+    # graph itself is what improves accuracy, or whether co-trained encoder
+    # weights carry the lift.
+    #
+    # dump_adj : directory; if non-empty, after a contrastive run save the
+    #            best-val post-processed adjacency to '{dump_adj}/seed{seed}.pt'
+    # load_adj : directory; with fixed_adj='load', read '{load_adj}/seed{seed}.pt'
+    #            and hand it to the downstream classifier verbatim.
+    dump_adj: str = ""
+    load_adj: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +285,65 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
     val_mask = dataset.val_mask.cuda() if use_cuda else dataset.val_mask
     test_mask = dataset.test_mask.cuda() if use_cuda else dataset.test_mask
 
+    # ---- graph-baseline ablation: skip learner entirely, evaluate on a
+    # fixed adjacency. Only meaningful for classification + dense path.
+    if cfg.fixed_adj != "none":
+        if cfg.sparse:
+            raise ValueError(f"fixed_adj={cfg.fixed_adj!r} requires -sparse 0")
+        if cfg.task != "classification":
+            raise ValueError(f"fixed_adj={cfg.fixed_adj!r} only supported for classification")
+        n = dataset.n_nodes
+        device = features.device
+        if cfg.fixed_adj == "identity":
+            # A = I, then sym-normalize (D = I so adj stays = I)
+            fixed = torch.eye(n, device=device)
+        elif cfg.fixed_adj == "anchor":
+            # The same anchor SUBLIME starts from: identity for SI, the
+            # dataset's real adjacency (sym-normalized) for SR.
+            fixed = _build_anchor_adj(dataset, cfg.gsl_mode, sparse=False)
+            if fixed.device != device:
+                fixed = fixed.to(device)
+        elif cfg.fixed_adj == "random_knn":
+            # k random neighbors per node (no self-edges), symmetrized + normalized
+            k = cfg.learner_k
+            fixed = torch.zeros(n, n, device=device)
+            for i in range(n):
+                # sample without replacement, exclude self
+                pool = torch.cat([torch.arange(i, device=device),
+                                  torch.arange(i + 1, n, device=device)])
+                idx = pool[torch.randperm(n - 1, device=device)[:k]]
+                fixed[i, idx] = 1.0
+            fixed = (fixed + fixed.t()) / 2.0
+            fixed = fixed + torch.eye(n, device=device)  # self-loops
+            deg = fixed.sum(dim=1) + 1e-10
+            d_inv_sqrt = deg.pow(-0.5)
+            fixed = d_inv_sqrt.unsqueeze(1) * fixed * d_inv_sqrt.unsqueeze(0)
+        elif cfg.fixed_adj == "load":
+            # Replay a SUBLIME-learned adjacency from disk through a vanilla GCN.
+            if not cfg.load_adj:
+                raise ValueError("fixed_adj='load' requires -load_adj <dir>")
+            path = os.path.join(cfg.load_adj, f"seed{seed}.pt")
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"fixed_adj='load' expected {path!r}; run with -dump_adj first")
+            fixed = torch.load(path, map_location=device)
+            if fixed.shape != (n, n):
+                raise ValueError(
+                    f"loaded adjacency shape {tuple(fixed.shape)} != expected ({n}, {n})")
+        else:
+            raise ValueError(f"unknown fixed_adj: {cfg.fixed_adj!r}")
+
+        result = TrialResult()
+        val_acc, test_acc = evaluate_classification(
+            fixed, features, labels, dataset.n_classes,
+            train_mask, val_mask, test_mask,
+            sparse=False, cfg=cls_cfg,
+        )
+        result.best_val_acc = float(val_acc) if torch.is_tensor(val_acc) else val_acc
+        result.best_test_acc = float(test_acc) if torch.is_tensor(test_acc) else test_acc
+        result.best_epoch = 0
+        return result
+
     # anchor adjacency: normalized once, possibly updated by bootstrap each epoch
     anchor_adj = _build_anchor_adj(dataset, cfg.gsl_mode, cfg.sparse)
     if use_cuda:
@@ -288,6 +371,7 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
 
     result = TrialResult()
     best_val = 0.0
+    best_adj = None   # for cfg.dump_adj: post-processed adj at best-val epoch
 
     # ---- loss-ablation: 'none' = no training, just eval the initial learner ----
     if cfg.loss_type == "none":
@@ -416,12 +500,30 @@ def train_one_trial(dataset: Dataset, cfg: TrainConfig, cls_cfg: ClsConfig,
                     result.best_val_acc = val_acc
                     result.best_test_acc = test_acc
                     result.best_epoch = epoch
+                    if cfg.dump_adj:
+                        # detach + clone so it survives subsequent in-place ops
+                        if cfg.sparse:
+                            best_adj = eval_adj.coalesce()
+                            best_adj = torch.sparse_coo_tensor(
+                                best_adj.indices().clone(),
+                                best_adj.values().clone(),
+                                best_adj.shape,
+                            ).coalesce()
+                        else:
+                            best_adj = eval_adj.detach().clone()
             else:  # clustering
                 with torch.no_grad():
                     _, embedding = model(features, learned_adj)
                 result.cluster_scores = evaluate_clustering(
                     embedding, labels, dataset.n_classes, n_trials=cfg.n_clu_trials,
                 )
+
+    # ---- Core-test-1: persist the best-val learned adjacency to disk ----
+    if cfg.dump_adj and best_adj is not None:
+        os.makedirs(cfg.dump_adj, exist_ok=True)
+        path = os.path.join(cfg.dump_adj, f"seed{seed}.pt")
+        torch.save(best_adj.cpu(), path)
+        print(f"[dump_adj] saved best-val adjacency -> {path}", flush=True)
 
     return result
 
