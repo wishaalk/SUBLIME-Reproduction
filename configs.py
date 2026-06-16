@@ -189,6 +189,50 @@ CONFIGS["news20_si"] = _cfg(
 )
 
 # ---------------------------------------------------------------------------
+# Extension: Transformer Graph Learner — Table 1 comparison
+# Each config mirrors its dataset's SI config, only swapping type_learner.
+# nhead must divide in_dim: wine=13 (prime) → 1; digits=64, 20news=236,
+# pubmed=500 → 4. cancer=30 → 1 (safe default).
+# WARNING: pubmed has 19k nodes; TransformerLearner uses O(n²) self-attention,
+# which requires ~1.5 GB per layer. It may OOM on smaller GPUs.
+# ---------------------------------------------------------------------------
+
+CONFIGS["wine_transformer_si"] = _cfg(**{
+    **CONFIGS["wine_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 1,
+    "learner_dropout": 0.1,
+})
+
+CONFIGS["cancer_transformer_si"] = _cfg(**{
+    **CONFIGS["cancer_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 1,
+    "learner_dropout": 0.1,
+})
+
+CONFIGS["digits_transformer_si"] = _cfg(**{
+    **CONFIGS["digits_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 4,
+    "learner_dropout": 0.1,
+})
+
+CONFIGS["news20_transformer_si"] = _cfg(**{
+    **CONFIGS["news20_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 4,
+    "learner_dropout": 0.1,
+})
+
+CONFIGS["pubmed_transformer_si"] = _cfg(**{
+    **CONFIGS["pubmed_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 4,
+    "learner_dropout": 0.1,
+})
+
+# ---------------------------------------------------------------------------
 # Table 2 — Structure Refinement
 # ---------------------------------------------------------------------------
 

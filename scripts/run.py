@@ -101,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="accepted for compatibility; not used by the new FGP learner")
     p.add_argument("-activation_learner", type=str, default="relu",
                    choices=["relu", "tanh"])
+    p.add_argument("-learner_n_heads", type=int, default=1,
+                   help="number of attention heads for TransformerLearner")
+    p.add_argument("-learner_dropout", type=float, default=0.1,
+                   help="dropout rate inside TransformerLearner encoder layers")
 
     # Evaluation Network (downstream GCN)
     p.add_argument("-epochs_cls", type=int, default=200)
@@ -189,6 +193,8 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         learner_activation=args.activation_learner,
         learner_metric=args.sim_function,
         learner_n_layers=2,
+        learner_n_heads=args.learner_n_heads,
+        learner_dropout=args.learner_dropout,
         maskfeat_rate_anchor=args.maskfeat_rate_anchor,
         maskfeat_rate_learner=args.maskfeat_rate_learner,
         epochs=args.epochs,
