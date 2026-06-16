@@ -221,14 +221,16 @@ CONFIGS["digits_transformer_si"] = _cfg(**{
 CONFIGS["news20_transformer_si"] = _cfg(**{
     **CONFIGS["news20_si"],
     "type_learner": "transformer",
-    "learner_n_heads": 4,
+    "learner_n_layers": 1,
+    "learner_n_heads": 2,
     "learner_dropout": 0.1,
 })
 
 CONFIGS["pubmed_transformer_si"] = _cfg(**{
     **CONFIGS["pubmed_si"],
     "type_learner": "transformer",
-    "learner_n_heads": 4,
+    "learner_n_layers": 1,
+    "learner_n_heads": 2,
     "learner_dropout": 0.1,
 })
 
