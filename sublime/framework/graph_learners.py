@@ -139,6 +139,25 @@ class _GCNConv(nn.Module):
             return torch.sparse.mm(norm_adj, h)
         return norm_adj @ h
 
+class _TransformerEncoderLayer(nn.Module):
+    """Wraps nn.TransformerEncoderLayer to expose the (n, d) -> (n, d) interface
+    expected by _MetricLearner._apply_layer (batch_first=True adds a singleton
+    batch dim internally)."""
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(self, x):
+        # x: (n, d) — unsqueeze to (1, n, d), pass through, squeeze back
+        return self.layer(x.unsqueeze(0)).squeeze(0)
+
 
 # ---------------------------------------------------------------------------
 # base class
@@ -238,6 +257,36 @@ def _identity_linear(in_dim):
     layer.weight = nn.Parameter(torch.eye(in_dim))
     nn.init.zeros_(layer.bias)
     return layer
+
+# Transformer encoder block: global self-attention over all n nodes as a sequence.
+# nhead=1 is the safe default
+class TransformerLearner(_MetricLearner):
+    def __init__(self, in_dim, n_layers=2, k=30, nhead=1,
+                 dim_feedforward=None, dropout=0.1,
+                 activation="relu", sparse=False):
+        if in_dim % nhead != 0:
+            raise ValueError(
+                f"in_dim ({in_dim}) must be divisible by nhead ({nhead})"
+            )
+        self.in_dim = in_dim
+        self.nhead = nhead
+        self.dim_feedforward = 4 * in_dim if dim_feedforward is None else dim_feedforward
+        self.dropout = dropout
+        super().__init__(n_layers, k, activation, sparse)   # builds self.layers
+
+    def _make_layer(self):
+        return _TransformerEncoderLayer(
+            self.in_dim, self.nhead, self.dim_feedforward, self.dropout
+        )
+
+    def _embed(self, features, adj):
+        # Each TransformerEncoderLayer already contains its own FFN activation,
+        # LayerNorm, and residual connections, so we skip the inter-layer
+        # activation that _MetricLearner._embed() would otherwise insert.
+        h = features
+        for layer in self.layers:
+            h = self._apply_layer(layer, h, adj)
+        return h
 
 
 # MLP: square linear maps, also model correlations between feature dims.

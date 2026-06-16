@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # GSL Module
     p.add_argument("-type_learner", type=str, default="fgp",
-                   choices=["fgp", "att", "mlp", "gnn"])
+                   choices=["fgp", "att", "mlp", "gnn", "transformer"])
     p.add_argument("-k", type=int, default=30)
     p.add_argument("-sim_function", type=str, default="cosine",
                    choices=["cosine", "minkowski"])

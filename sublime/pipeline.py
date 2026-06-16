@@ -39,6 +39,7 @@ from .framework.graph_learners import (
     GNNLearner,
     GraphLearner,
     MLPLearner,
+    TransformerLearner
 )
 from .framework.post_processor import post_process_dense, post_process_sparse
 
@@ -63,11 +64,13 @@ class TrainConfig:
     dropout_adj: float = 0.5
 
     # learner
-    learner_type: str = "fgp"        # 'fgp' | 'att' | 'mlp' | 'gnn'
+    learner_type: str = "fgp"        # 'fgp' | 'att' | 'mlp' | 'gnn' | 'transformer'
     learner_k: int = 30
-    learner_activation: str = "relu" # between-layer activation for ATT/MLP/GNN
+    learner_activation: str = "relu" # between-layer activation for ATT/MLP/GNN/TRANSFORMER
     learner_metric: str = "cosine"   # kNN metric for FGP init
-    learner_n_layers: int = 2        # only used by ATT/MLP/GNN
+    learner_n_layers: int = 2        # only used by ATT/MLP/GNN/TRANSFORMER
+    learner_n_heads: int = 1         # only used by TRANSFORMER
+    learner_dropout: float = 0.1     # only used by TRANSFORMER
 
     # augmentation
     maskfeat_rate_anchor: float = 0.2
@@ -199,6 +202,8 @@ def _build_learner(cfg: TrainConfig, features: torch.Tensor, gnn_adj: torch.Tens
     if cfg.learner_type == "gnn":
         # gnn_adj is stored implicitly: pipeline passes it on every forward
         return GNNLearner(in_dim=in_dim, **common)
+    if cfg.learner_type == "transformer":
+        return TransformerLearner(in_dim=in_dim, nhead=cfg.learner_n_heads, dropout=cfg.learner_dropout)
     raise ValueError(f"unknown learner_type: {cfg.learner_type!r}")
 
 
