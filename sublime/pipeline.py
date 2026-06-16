@@ -205,12 +205,9 @@ def _build_learner(cfg: TrainConfig, features: torch.Tensor, gnn_adj: torch.Tens
     if cfg.learner_type == "transformer":
         return TransformerLearner(
             in_dim=in_dim,
-            n_layers=cfg.learner_n_layers,
-            k=cfg.learner_k,
             nhead=cfg.learner_n_heads,
             dropout=cfg.learner_dropout,
-            activation=cfg.learner_activation,
-            sparse=cfg.sparse,
+            **common
         )
     raise ValueError(f"unknown learner_type: {cfg.learner_type!r}")
 

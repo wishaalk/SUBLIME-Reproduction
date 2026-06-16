@@ -141,8 +141,10 @@ class _GCNConv(nn.Module):
 
 class _TransformerEncoderLayer(nn.Module):
     """Wraps nn.TransformerEncoderLayer to expose the (n, d) -> (n, d) interface
-    expected by _MetricLearner._apply_layer (batch_first=True adds a singleton
-    batch dim internally)."""
+    expected by _MetricLearner._apply_layer.
+
+    PyTorch <1.9 uses (seq, batch, d) convention; we treat the n nodes as the
+    sequence and use a singleton batch dimension."""
 
     def __init__(self, d_model, nhead, dim_feedforward, dropout):
         super().__init__()
@@ -151,12 +153,11 @@ class _TransformerEncoderLayer(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True,
         )
 
     def forward(self, x):
-        # x: (n, d) — unsqueeze to (1, n, d), pass through, squeeze back
-        return self.layer(x.unsqueeze(0)).squeeze(0)
+        # x: (n, d) -> (n, 1, d) [seq, batch, d] -> (n, d)
+        return self.layer(x.unsqueeze(1)).squeeze(1)
 
 
 # ---------------------------------------------------------------------------
