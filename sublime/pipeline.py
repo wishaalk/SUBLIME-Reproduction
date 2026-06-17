@@ -71,6 +71,7 @@ class TrainConfig:
     learner_n_layers: int = 2        # only used by ATT/MLP/GNN/TRANSFORMER
     learner_n_heads: int = 1         # only used by TRANSFORMER
     learner_dropout: float = 0.1     # only used by TRANSFORMER
+    learner_k_lap: int = 0           # LapPE eigenvectors; 0 = disabled (SI); >0 for SR only
 
     # augmentation
     maskfeat_rate_anchor: float = 0.2
@@ -203,7 +204,7 @@ def _build_learner(cfg: TrainConfig, features: torch.Tensor, gnn_adj: torch.Tens
         # gnn_adj is stored implicitly: pipeline passes it on every forward
         return GNNLearner(in_dim=in_dim, **common)
     if cfg.learner_type == "transformer":
-        return TransformerLearner(
+        learner = TransformerLearner(
             in_dim=in_dim,
             n_layers=cfg.learner_n_layers,
             k=cfg.learner_k,
@@ -211,7 +212,13 @@ def _build_learner(cfg: TrainConfig, features: torch.Tensor, gnn_adj: torch.Tens
             dropout=cfg.learner_dropout,
             activation=cfg.learner_activation,
             sparse=cfg.sparse,
+            k_lap=cfg.learner_k_lap,
         )
+        # LapPE is only meaningful in SR mode where gnn_adj is a real graph.
+        # In SI mode gnn_adj is the normalised identity, for which LapPE is degenerate.
+        if cfg.learner_k_lap > 0 and cfg.gsl_mode == "structure_refinement":
+            learner.set_lap_pe(gnn_adj)
+        return learner
     raise ValueError(f"unknown learner_type: {cfg.learner_type!r}")
 
 

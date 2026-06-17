@@ -107,6 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="number of attention heads for TransformerLearner")
     p.add_argument("-learner_dropout", type=float, default=0.1,
                    help="dropout rate inside TransformerLearner encoder layers")
+    p.add_argument("-learner_k_lap", type=int, default=0,
+                   help="number of Laplacian eigenvectors for LapPE in TransformerLearner "
+                        "(0 = disabled; only active in structure_refinement mode)")
 
     # Evaluation Network (downstream GCN)
     p.add_argument("-epochs_cls", type=int, default=200)
@@ -197,6 +200,7 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         learner_n_layers=args.learner_n_layers,
         learner_n_heads=args.learner_n_heads,
         learner_dropout=args.learner_dropout,
+        learner_k_lap=args.learner_k_lap,
         maskfeat_rate_anchor=args.maskfeat_rate_anchor,
         maskfeat_rate_learner=args.maskfeat_rate_learner,
         epochs=args.epochs,

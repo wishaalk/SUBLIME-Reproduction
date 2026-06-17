@@ -214,7 +214,7 @@ CONFIGS["cancer_transformer_si"] = _cfg(**{
 CONFIGS["digits_transformer_si"] = _cfg(**{
     **CONFIGS["digits_si"],
     "type_learner": "transformer",
-    "learner_n_heads": 4,
+    "learner_n_heads": 2,
     "learner_dropout": 0.1,
 })
 
@@ -222,7 +222,7 @@ CONFIGS["news20_transformer_si"] = _cfg(**{
     **CONFIGS["news20_si"],
     "type_learner": "transformer",
     "learner_n_layers": 1,
-    "learner_n_heads": 2,
+    "learner_n_heads": 4,
     "learner_dropout": 0.1,
 })
 
@@ -230,7 +230,7 @@ CONFIGS["pubmed_transformer_si"] = _cfg(**{
     **CONFIGS["pubmed_si"],
     "type_learner": "transformer",
     "learner_n_layers": 1,
-    "learner_n_heads": 2,
+    "learner_n_heads": 4,
     "learner_dropout": 0.1,
 })
 
@@ -428,3 +428,105 @@ CONFIGS["fig5_robustness"] = [
     for mode in ("delete", "add")
     for r in _FIG5_RATES
 ]
+
+# ===========================================================================
+# Extension Experiments
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Experiment 1 — Structure Inference learner comparison
+# 4 learners (FGP, ATT, MLP, Transformer) × 4 non-graph datasets
+# (Wine, Cancer, Digits, 20news).  Existing configs cover FGP for
+# Wine/Cancer/Digits, MLP for 20news, and Transformer for all four.
+# This block adds the missing ATT + MLP for Wine/Cancer/Digits and
+# FGP + ATT for 20news.  All hyperparameters inherited from the
+# dataset's primary SI config for a fair comparison.
+# ---------------------------------------------------------------------------
+
+CONFIGS["wine_att_si"] = _cfg(**{**CONFIGS["wine_si"], "type_learner": "att"})
+CONFIGS["wine_mlp_si"] = _cfg(**{**CONFIGS["wine_si"], "type_learner": "mlp"})
+
+CONFIGS["cancer_att_si"] = _cfg(**{**CONFIGS["cancer_si"], "type_learner": "att"})
+CONFIGS["cancer_mlp_si"] = _cfg(**{**CONFIGS["cancer_si"], "type_learner": "mlp"})
+
+CONFIGS["digits_att_si"] = _cfg(**{**CONFIGS["digits_si"], "type_learner": "att"})
+CONFIGS["digits_mlp_si"] = _cfg(**{**CONFIGS["digits_si"], "type_learner": "mlp"})
+
+# 20news FGP: reduce k to 20 so the kNN init doesn't over-connect 9607 nodes
+CONFIGS["news20_fgp_si"] = _cfg(**{**CONFIGS["news20_si"], "type_learner": "fgp", "k": 20})
+CONFIGS["news20_att_si"] = _cfg(**{**CONFIGS["news20_si"], "type_learner": "att"})
+
+# ---------------------------------------------------------------------------
+# Experiment 2 — Structure Refinement learner comparison
+# GNN vs MLP vs Transformer+LapPE on Cora and Citeseer.
+# Base hyperparameters from cora_sr / citeseer_sr for fair comparison.
+# Cora d=1433 (prime) and Citeseer d=3703 both → nhead=1.
+# k_lap=8: 8 smallest non-trivial eigenvectors of the normalised Laplacian.
+# ---------------------------------------------------------------------------
+
+CONFIGS["cora_gnn_sr"] = _cfg(**{**CONFIGS["cora_sr"], "type_learner": "gnn"})
+CONFIGS["cora_mlp_sr"] = _cfg(**{**CONFIGS["cora_sr"], "type_learner": "mlp"})
+CONFIGS["cora_transformer_sr"] = _cfg(**{
+    **CONFIGS["cora_sr"],
+    "type_learner": "transformer",
+    "learner_n_layers": 1,
+    "learner_n_heads": 1,
+    "learner_dropout": 0.1,
+    "learner_k_lap": 8,
+})
+
+CONFIGS["citeseer_gnn_sr"] = _cfg(**{**CONFIGS["citeseer_sr"], "type_learner": "gnn"})
+CONFIGS["citeseer_mlp_sr"] = _cfg(**{**CONFIGS["citeseer_sr"], "type_learner": "mlp"})
+CONFIGS["citeseer_transformer_sr"] = _cfg(**{
+    **CONFIGS["citeseer_sr"],
+    "type_learner": "transformer",
+    "learner_n_layers": 1,
+    "learner_n_heads": 1,
+    "learner_dropout": 0.1,
+    "learner_k_lap": 8,
+})
+
+# ---------------------------------------------------------------------------
+# Experiment 3 — Transformer hyperparameter ablation (Structure Inference)
+# Sweep: (a) number of attention heads, (b) number of encoder layers.
+# Datasets: Cancer (d=30, heads sweep) + Digits (d=64, both sweeps)
+#           + Wine (d=13 prime, layers sweep only — nhead must be 1).
+#
+# Ablation bases: nhead=1, n_layers=2 (wine_transformer_si already serves
+# as the wine base; cancer/digits get explicit base configs below).
+# ---------------------------------------------------------------------------
+
+# Ablation base configs (nhead=1, n_layers=2 — controlled reference point)
+CONFIGS["cancer_trans_base_si"] = _cfg(**{
+    **CONFIGS["cancer_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 1,
+    "learner_n_layers": 2,
+    "learner_dropout": 0.1,
+})
+
+CONFIGS["digits_trans_base_si"] = _cfg(**{
+    **CONFIGS["digits_si"],
+    "type_learner": "transformer",
+    "learner_n_heads": 1,
+    "learner_n_layers": 2,
+    "learner_dropout": 0.1,
+})
+
+# (a) Heads sweep — Cancer nhead ∈ {1,2,3,5}; Digits nhead ∈ {1,2,4,8}
+#     nhead=1 baselines are the *_trans_base_si configs above.
+CONFIGS["cancer_trans_h2_si"] = _cfg(**{**CONFIGS["cancer_trans_base_si"], "learner_n_heads": 2})
+CONFIGS["cancer_trans_h3_si"] = _cfg(**{**CONFIGS["cancer_trans_base_si"], "learner_n_heads": 3})
+CONFIGS["cancer_trans_h5_si"] = _cfg(**{**CONFIGS["cancer_trans_base_si"], "learner_n_heads": 5})
+
+CONFIGS["digits_trans_h2_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_heads": 2})
+CONFIGS["digits_trans_h4_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_heads": 4})
+CONFIGS["digits_trans_h8_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_heads": 8})
+
+# (b) Layers sweep — Wine n_layers ∈ {1,2,3}; Digits n_layers ∈ {1,2,3}
+#     n_layers=2 baselines: wine_transformer_si (wine) / digits_trans_base_si (digits).
+CONFIGS["wine_trans_l1_si"] = _cfg(**{**CONFIGS["wine_transformer_si"], "learner_n_layers": 1})
+CONFIGS["wine_trans_l3_si"] = _cfg(**{**CONFIGS["wine_transformer_si"], "learner_n_layers": 3})
+
+CONFIGS["digits_trans_l1_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_layers": 1})
+CONFIGS["digits_trans_l3_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_layers": 3})
