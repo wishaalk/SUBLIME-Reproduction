@@ -528,5 +528,8 @@ CONFIGS["digits_trans_h8_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "lear
 CONFIGS["wine_trans_l1_si"] = _cfg(**{**CONFIGS["wine_transformer_si"], "learner_n_layers": 1})
 CONFIGS["wine_trans_l3_si"] = _cfg(**{**CONFIGS["wine_transformer_si"], "learner_n_layers": 3})
 
+CONFIGS["cancer_trans_l1_si"] = _cfg(**{**CONFIGS["cancer_trans_base_si"], "learner_n_layers": 1})
+CONFIGS["cancer_trans_l3_si"] = _cfg(**{**CONFIGS["cancer_trans_base_si"], "learner_n_layers": 3})
+
 CONFIGS["digits_trans_l1_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_layers": 1})
 CONFIGS["digits_trans_l3_si"] = _cfg(**{**CONFIGS["digits_trans_base_si"], "learner_n_layers": 3})
